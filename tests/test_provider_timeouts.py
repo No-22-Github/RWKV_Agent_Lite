@@ -90,6 +90,62 @@ async def test_custom_provider_uses_plain_openai_client_and_chat_payload(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_custom_provider_collapses_repeated_newlines_in_text_messages(monkeypatch) -> None:
+    request_kwargs: dict[str, object] = {}
+
+    class _FakeCreate:
+        async def __call__(self, **kwargs):
+            request_kwargs.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content="ok", tool_calls=None),
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+    monkeypatch.setattr(
+        "rvoone.providers.custom_provider.AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=_FakeCreate()))
+        ),
+    )
+
+    provider = CustomProvider(
+        api_key="key",
+        api_base="http://localhost:8000/v1",
+        default_model="model",
+    )
+
+    await provider.chat(
+        messages=[
+            {"role": "system", "content": "a\n\nb\n\n\nc"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello\r\n\r\nworld"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                ],
+            },
+        ],
+        model="model",
+    )
+
+    assert request_kwargs["messages"] == [
+        {"role": "system", "content": "a\n------\nb\n------\nc"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello\n------\nworld"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+            ],
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_custom_provider_token_estimation_is_best_effort(monkeypatch) -> None:
     monkeypatch.setattr(
         "rvoone.providers.base._get_tokenizer",

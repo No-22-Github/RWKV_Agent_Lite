@@ -1,6 +1,7 @@
 """Base LLM provider interface."""
 
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -11,6 +12,7 @@ from loguru import logger
 
 _tokenizer_cache: dict[str, Any] = {}
 TextDeltaHandler = Callable[[str], Awaitable[None]]
+_MULTI_NEWLINE_PATTERN = re.compile(r"(?:\r?\n){2,}")
 
 
 def _get_tokenizer(model: str = "gpt-4o") -> Any:
@@ -54,6 +56,11 @@ def _count_message_content_tokens(content: Any, tokenizer: Any) -> int:
     if content is not None:
         total += len(tokenizer.encode(json.dumps(content, ensure_ascii=False)))
     return total
+
+
+def _normalize_multiline_text(text: str) -> str:
+    """Collapse 2+ consecutive newlines for RWKV-compatible prompt formatting."""
+    return _MULTI_NEWLINE_PATTERN.sub("\n------\n", text)
 
 
 def estimate_tokens(
@@ -155,22 +162,29 @@ class LLMProvider(ABC):
 
         Empty content can appear when MCP tools return nothing. Most providers
         reject empty-string content or empty text blocks in list content.
+        Also collapse repeated blank lines because RWKV-style backends can be
+        overly sensitive to multi-line separators in prompt text.
         """
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
 
-            if isinstance(content, str) and not content:
-                clean = dict(msg)
-                clean["content"] = (
-                    None
-                    if (msg.get("role") == "assistant" and msg.get("tool_calls"))
-                    else "(empty)"
-                )
+            if isinstance(content, str):
+                normalized = _normalize_multiline_text(content)
+                clean = dict(msg) if normalized != content else msg
+                if not normalized:
+                    clean["content"] = (
+                        None
+                        if (msg.get("role") == "assistant" and msg.get("tool_calls"))
+                        else "(empty)"
+                    )
+                else:
+                    clean["content"] = normalized
                 result.append(clean)
                 continue
 
             if isinstance(content, list):
+                changed = False
                 filtered = [
                     item
                     for item in content
@@ -181,9 +195,24 @@ class LLMProvider(ABC):
                     )
                 ]
                 if len(filtered) != len(content):
+                    changed = True
+                normalized_items: list[Any] = []
+                for item in filtered:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") in ("text", "input_text", "output_text")
+                        and isinstance(item.get("text"), str)
+                    ):
+                        normalized_text = _normalize_multiline_text(item["text"])
+                        if normalized_text != item["text"]:
+                            changed = True
+                            normalized_items.append({**item, "text": normalized_text})
+                            continue
+                    normalized_items.append(item)
+                if changed:
                     clean = dict(msg)
-                    if filtered:
-                        clean["content"] = filtered
+                    if normalized_items:
+                        clean["content"] = normalized_items
                     elif msg.get("role") == "assistant" and msg.get("tool_calls"):
                         clean["content"] = None
                     else:
